@@ -25,31 +25,64 @@
 
 ## 🚀 快速开始
 
-### 环境要求
-
-- Python 3.8+
-
-### 安装
+### 第一步：下载项目
 
 ```bash
-git clone https://github.com/<你的用户名>/JZ-NNU-course-grabber.git
+git clone https://github.com/1113878425-alt/JZ-NNU-course-grabber.git
 cd JZ-NNU-course-grabber
-pip install -r requirements.txt
 ```
 
-### 运行
+> 也可以直接在 GitHub 页面点 **Code → Download ZIP** 解压。
+
+### 第二步：运行（三种方式，任选其一）
+
+#### 方式一：一键脚本（最省事，推荐）
+
+脚本会自动检测 Python、创建虚拟环境、安装依赖、启动程序，**无需手动配置环境**。
+
+- **Windows**：双击 `run.bat`（或在命令行执行 `run.bat`）
+- **macOS / Linux**：
+
+  ```bash
+  chmod +x run.sh
+  ./run.sh
+  ```
+
+#### 方式二：uv 一行命令（无需手动安装 Python）
+
+[uv](https://github.com/astral-sh/uv) 会自动下载 Python、创建环境、装依赖：
 
 ```bash
+# 安装 uv（只需一次）
+pip install uv          # 或 curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# 一行运行
+uv run main.py
+```
+
+#### 方式三：手动安装（传统方式）
+
+```bash
+pip install -r requirements.txt
 python main.py
 ```
 
-按提示输入学号、密码、验证码，选择轮次后，脚本会**逐个询问**要抢的课程：
+> **国内网络慢？** 用清华镜像源加速：
+> `pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple`
+
+### 第三步：按提示操作
+
+启动后按提示输入学号、密码、验证码，选择轮次后，脚本会**逐个询问**要抢的课程：
 
 1. 输入 **课程名**（可留空）、**老师**（可留空）、**课程号**（可留空），至少填一项；
 2. 脚本检索并列出所有匹配的教学班（课程名 / 课程号 / 教师 / 时间地点 / 余量 / 教学班ID，已满的标注【已满】）；
 3. 手动勾选要抢的教学班编号（可多选，如 `1,3`）；
 4. 可继续添加下一门，或输入 `n` 结束添加；
 5. 选择抢课模式开始抢课。
+
+### 环境要求
+
+- Python 3.8+（用方式二 uv 时无需自行安装）
 
 ## ⚙️ 配置
 
@@ -101,19 +134,30 @@ cp config.example.json config.json
 ```
 .
 ├── main.py              # 主程序（交互 + 检索 + 抢课逻辑）
-├── nnu_client.py        # 登录 / 选课接口封装
+├── nnu_client.py        # 登录 / 选课接口封装（含自动重试）
 ├── des.py               # 前端 3DES 加密算法的 Python 复刻
+├── run.bat / run.sh     # 一键启动脚本（自动装依赖）
+├── test_fixes.py        # 回归测试（加密 / 余量 / 抢课循环）
 ├── config.example.json  # 配置模板
 ├── requirements.txt     # 依赖清单
 ├── LICENSE              # MIT 许可证
 └── README.md
 ```
 
+## 🧪 测试
+
+```bash
+python test_fixes.py
+```
+
+覆盖：加密正确性（与前端原 JS 交叉验证）、余量计算、抢课循环下标与重试、网络层重试配置。
+
 ## ⚠️ 注意事项
 
 1. **验证码**：登录时脚本会弹出验证码图片，看清输入即可；若为点选式验证码（少见），请改用浏览器登录。
 2. **token 有效期**：登录后 token 一般可用一段时间；若抢课中提示登录失效，需重新运行脚本登录。
 3. **合规**：请遵守学校选课管理规定，理性使用，避免对服务器造成过大压力，注意账号安全。
+4. **网络重试**：脚本内置自动重试（HTTP 层 3 次 + 抢课循环 300 轮），网络抖动不会导致脚本崩溃。
 
 ## 📄 许可证
 
