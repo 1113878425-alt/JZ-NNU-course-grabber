@@ -7,6 +7,12 @@
 import time
 import json
 import requests
+from requests.adapters import HTTPAdapter
+
+try:
+    from urllib3.util.retry import Retry
+except ImportError:  # urllib3 旧版本
+    from urllib3.util import Retry
 
 import des
 
@@ -15,19 +21,59 @@ BASE_URL = "https://xsxk.nnu.edu.cn:443/xsxkapp"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
+# 网络层自动重试策略：连接/读超时等可重试错误自动重试，指数退避。
+# 抢课高峰期网络抖动频繁，没有这层重试脚本很容易直接崩掉。
+_RETRY = Retry(
+    total=3,
+    connect=3,
+    read=3,
+    backoff_factor=0.2,
+    status_forcelist=(500, 502, 503, 504),
+    allowed_methods=frozenset(["GET", "POST"]),
+    raise_on_status=False,
+)
+
 
 class NnuError(Exception):
     """选课系统业务异常。"""
 
 
+def _to_int(value):
+    """尽力把值转成 int，失败返回 None。"""
+    if value in (None, ""):
+        return None
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _calc_remain_from_capacity(data):
+    """
+    由余量接口返回的 data 计算剩余名额：
+        余量 = classCapacity - numberOfSelected
+    无法计算时返回 None。
+    """
+    cap = _to_int(data.get("classCapacity"))
+    selected = _to_int(data.get("numberOfSelected"))
+    if cap is None or selected is None:
+        return None
+    return max(0, cap - selected)
+
+
 class NnuClient:
-    def __init__(self, timeout=10):
+    def __init__(self, timeout=10, pool_size=32):
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": UA,
             "Accept": "application/json, text/javascript, */*; q=0.01",
             "X-Requested-With": "XMLHttpRequest",
         })
+        # 连接池 + 自动重试（并发抢课时连接复用，提升速度与稳定性）
+        adapter = HTTPAdapter(max_retries=_RETRY, pool_connections=pool_size,
+                              pool_maxsize=pool_size)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
         self.timeout = timeout
         self.token = None          # 登录凭证
         self.student = None        # 学生信息 dict（含 code/name/campus/electiveBatch 等）
@@ -39,24 +85,33 @@ class NnuClient:
         headers = {}
         if auth and self.token:
             headers["token"] = self.token
-        r = self.session.get(url, params=params, headers=headers,
-                             timeout=self.timeout, verify=False)
+        try:
+            r = self.session.get(url, params=params, headers=headers,
+                                 timeout=self.timeout, verify=False)
+        except requests.exceptions.RequestException as e:
+            raise NnuError("网络请求失败: %s" % e)
         return self._parse(r)
 
     def _post(self, url, data=None, auth=True):
         headers = {}
         if auth and self.token:
             headers["token"] = self.token
-        r = self.session.post(url, data=data, headers=headers,
-                              timeout=self.timeout, verify=False)
+        try:
+            r = self.session.post(url, data=data, headers=headers,
+                                  timeout=self.timeout, verify=False)
+        except requests.exceptions.RequestException as e:
+            raise NnuError("网络请求失败: %s" % e)
         return self._parse(r)
 
     @staticmethod
     def _parse(resp):
-        resp.raise_for_status()
+        try:
+            resp.raise_for_status()
+        except requests.exceptions.HTTPError as e:
+            raise NnuError("接口返回 HTTP 错误: %s" % e)
         try:
             return resp.json()
-        except Exception:
+        except ValueError:
             raise NnuError("接口返回非 JSON 数据（可能是网络异常或已掉线）")
 
     def _check(self, resp):
@@ -187,7 +242,17 @@ class NnuClient:
         return all_data
 
     def query_capacity(self, tc_id, capacity_suffix=None):
-        """查询教学班实时余量。"""
+        """
+        查询教学班实时余量。
+
+        接口返回 data 字段（已从前端 grablessons.js flushTeachingClassCapacity 核实）：
+            - numberOfSelected : 已选人数
+            - classCapacity    : 容量
+            - limitGender / capacityOfMale / numberOfMale / capacityOfFemale / numberOfFemale
+
+        余量 = classCapacity - numberOfSelected。为便于调用方使用，这里额外
+        在返回 dict 中补充 remaining 字段（无法计算时为 None）。
+        """
         url = BASE_URL + "/sys/xsxkapp/elective/teachingclass/capacity.do"
         params = {"tcId": tc_id, "xh": self.number}
         if capacity_suffix:
@@ -195,7 +260,9 @@ class NnuClient:
         resp = self._get(url, params=params)
         if not self._check(resp):
             raise NnuError("查询余量失败: %s" % resp.get("msg", ""))
-        return resp.get("data") or {}
+        data = resp.get("data") or {}
+        data["remaining"] = _calc_remain_from_capacity(data)
+        return data
 
     # ---------------- 选课 / 退课 ----------------
     def _build_add_param(self, batch_code, tc_id, campus=None,

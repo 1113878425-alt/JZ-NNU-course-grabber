@@ -253,9 +253,14 @@ def add_target_interactive(client, batch_code, ttype):
     return targets
 
 
-def wait_result(client, timeout=3.0):
-    """提交后轮询处理结果。返回 (成功?, resp)。"""
-    for _ in range(int(timeout * 2)):
+def wait_result(client, timeout=3.0, interval=0.15):
+    """提交后轮询处理结果。返回 (成功?, resp)。
+
+    成功 -> (True, resp)；失败 -> (False, resp)；超时未定 -> (None, None)。
+    轮询间隔越短越能在抢课黄金期抢先确认结果。
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
         try:
             resp = client.query_status()
         except NnuError:
@@ -265,15 +270,23 @@ def wait_result(client, timeout=3.0):
             return True, resp
         if code == "-1":
             return False, resp
-        time.sleep(0.5)
+        time.sleep(interval)
     return None, None
 
 
 def grab_loop(client, batch_code, targets, workers=5, retry_interval=0.3,
               max_retries=300, stop_event=None):
-    """多线程并发抢课。返回成功列表。"""
+    """多线程并发抢课。返回成功列表。
+
+    关键设计：
+    - 用「下标」而非 target 值来跟踪进度，避免两门内容相同的课互相串位；
+    - "maybe"（已提交但结果未确认）也纳入下一轮重试，避免静默漏课；
+    - 线程池只创建一次并复用，避免每轮重建的开销。
+    """
+    if stop_event is None:
+        stop_event = threading.Event()
     success = []
-    done = set()  # 已抢到的课程下标
+    done = set()  # 已抢到的下标
 
     def attempt(target):
         try:
@@ -287,32 +300,39 @@ def grab_loop(client, batch_code, targets, workers=5, retry_interval=0.3,
                 if ok:
                     return ("success", target, resp.get("msg") or "")
                 elif ok is None:
-                    return ("maybe", target, "已提交，处理中")
+                    # 已提交但结果未知，交给下一轮重试确认
+                    return ("retry", target, "已提交，结果待确认")
                 else:
                     return ("fail", target, "处理失败，可能名额已满或冲突")
             return ("fail", target, resp.get("msg") or "提交失败(code=%s)" % code)
         except NnuError as e:
             return ("fail", target, str(e))
+        except Exception as e:  # 兜底：任何意外都不能让抢课线程崩掉
+            return ("fail", target, "异常: %s" % e)
 
-    retries = 0
-    while not stop_event.is_set() and len(done) < len(targets) and retries < max_retries:
-        pending = [t for i, t in enumerate(targets) if i not in done]
-        with ThreadPoolExecutor(max_workers=min(workers, len(pending))) as pool:
-            futures = [pool.submit(attempt, t) for t in pending]
-            for f in as_completed(futures):
+    executor = ThreadPoolExecutor(max_workers=max(1, workers))
+    try:
+        retries = 0
+        while not stop_event.is_set() and len(done) < len(targets) and retries < max_retries:
+            pending = [(i, t) for i, t in enumerate(targets) if i not in done]
+            if not pending:
+                break
+            future_map = {executor.submit(attempt, t): i for i, t in pending}
+            for f in as_completed(future_map):
+                idx = future_map[f]
                 status, target, msg = f.result()
-                idx = targets.index(target)
                 if status == "success":
                     log("✔ 抢课成功: %s (%s)" % (target["name"], target["tc_id"]))
                     success.append(target)
                     done.add(idx)
-                elif status == "maybe":
-                    log("? %s 已提交待确认" % target["name"])
-                else:
-                    pass  # 失败静默，继续重试
-        retries += 1
-        if len(done) < len(targets):
-            time.sleep(retry_interval)
+                elif status == "retry":
+                    log("… %s 已提交待确认，将在下一轮复核" % target["name"])
+                # fail 静默，继续重试
+            retries += 1
+            if len(done) < len(targets) and not stop_event.is_set():
+                time.sleep(retry_interval)
+    finally:
+        executor.shutdown(wait=False)
     return success
 
 
@@ -325,15 +345,15 @@ def monitor_mode(client, batch_code, targets, interval=2, max_workers=5):
             for t in targets:
                 try:
                     cap = client.query_capacity(t["tc_id"])
-                    remain = cap.get("remainingCapacity", cap.get("kyl", "?"))
+                    remain = cap.get("remaining")
+                    if remain is None:
+                        log("监控 %s: 余量未知（接口字段异常）" % t["name"])
+                        continue
                     log("监控 %s: 当前余量=%s" % (t["name"], remain))
-                    try:
-                        if int(remain) > 0:
-                            log("发现余量，立即抢 %s ..." % t["name"])
-                            grab_loop(client, batch_code, [t], workers=max_workers,
-                                      retry_interval=0.2, max_retries=20, stop_event=stop)
-                    except (TypeError, ValueError):
-                        pass
+                    if remain > 0:
+                        log("发现余量，立即抢 %s ..." % t["name"])
+                        grab_loop(client, batch_code, [t], workers=max_workers,
+                                  retry_interval=0.2, max_retries=20, stop_event=stop)
                 except NnuError as e:
                     log("余量查询失败: %s" % e)
             time.sleep(interval)
@@ -377,19 +397,21 @@ def main():
     log("当前轮次: %s (code=%s)" % (batch.get("name", ""), batch_code))
 
     # 目标课程确定
-    ttype = cfg.get("teaching_class_type") or "XGXK"
+    # 课程类型：优先用 config 中的设置；仅当 config 未设置时才询问用户
+    ttype = cfg.get("teaching_class_type")
+    if not ttype:
+        ttype = input("课程类型(XGXK=校公选课/FANKC=方案内，默认XGXK): ").strip() or "XGXK"
     cfg_targets = cfg.get("targets") or []
     # config 已预填教学班ID则直接使用，否则交互式检索添加
     if cfg_targets and all(t.get("tc_id") for t in cfg_targets):
-        log("使用 config.json 中预填的目标课程")
+        log("使用 config.json 中预填的目标课程（课程类型: %s）" % ttype)
         targets = [{
             "name": t.get("name", ""),
             "tc_id": t.get("tc_id"),
             "campus": t.get("campus") or client.campus_code,
-            "teaching_class_type": t.get("teaching_class_type", ttype),
+            "teaching_class_type": t.get("teaching_class_type") or ttype,
         } for t in cfg_targets]
     else:
-        ttype = input("课程类型(XGXK=校公选课/FANKC=方案内，默认XGXK): ").strip() or "XGXK"
         targets = add_target_interactive(client, batch_code, ttype)
     if not targets:
         log("没有有效的目标课程，退出")
